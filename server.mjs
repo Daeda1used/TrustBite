@@ -761,6 +761,9 @@ async function finishBountyEscrowOnLedger(wallets, bounty) {
       Owner: bounty.merchantAddress,
       OfferSequence: bounty.escrowSequence
     });
+    for (const wallet of Object.values(wallets)) {
+      if (wallet.classicAddress) wallet.balanceXrp = await getBalance(client, wallet.classicAddress);
+    }
     await refreshBountyTokenBalances(client, wallets);
     return result.hash;
   });
