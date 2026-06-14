@@ -272,6 +272,27 @@ function txUrl(hash) {
   return `${state.explorerBase}/${hash}`;
 }
 
+function bountyCurrency(bounty = null) {
+  return bounty?.fundingCurrency || state?.bountyRules?.fundingCurrency || 'XRP';
+}
+
+function bountyAssetLabel(amount, currency) {
+  const value = Number(amount || 0);
+  return `${Number.isFinite(value) ? value.toFixed(2) : '0.00'} ${currency}`;
+}
+
+function bountyMethodLabel(bounty) {
+  if (bounty?.fundingMethod === 'token_escrow') return 'locked via TokenEscrow';
+  if (bounty?.fundingMethod === 'xrp_escrow_fallback') return 'locked via XRP Escrow fallback';
+  return bounty?.fundingTxHash ? 'funded by XRPL payment' : 'not funded yet';
+}
+
+function bountyPillTone(status) {
+  if (['assigned', 'released'].includes(status)) return 'good';
+  if (['locked', 'funded'].includes(status)) return 'warn';
+  return 'neutral';
+}
+
 function restaurantById(id) {
   return state.restaurants.find((item) => item.id === id);
 }
@@ -1310,15 +1331,17 @@ function renderBountyCards(restaurant) {
     <div class="bounty-list">
       ${bounties.length ? bounties.map((bounty) => `
         <div class="bounty-card">
-          ${pill(bounty.status, bounty.status === 'assigned' ? 'good' : 'warn')}
+          ${pill(bounty.status, bountyPillTone(bounty.status))}
           <strong>${escapeHtml(bounty.focusArea)} - ${bounty.expertCount} experts</strong>
-          <small>${bounty.totalXrp} XRP funded - ${bounty.rewardPerExpertXrp} XRP per expert</small>
+          <small>${bountyAssetLabel(bounty.totalXrp, bountyCurrency(bounty))} ${bountyMethodLabel(bounty)} - ${bountyAssetLabel(bounty.rewardPerExpertXrp, bountyCurrency(bounty))} per expert</small>
+          ${bounty.escrowFinishAfter ? `<small>Escrow release after ${new Date(bounty.escrowFinishAfter).toLocaleString()}</small>` : ''}
           <div class="message-links">
-            ${bounty.fundingTxHash ? `<a target="_blank" rel="noreferrer" href="${txUrl(bounty.fundingTxHash)}">Funding tx</a>` : ''}
+            ${bounty.fundingTxHash ? `<a target="_blank" rel="noreferrer" href="${txUrl(bounty.fundingTxHash)}">EscrowCreate tx</a>` : ''}
             ${bounty.assignmentTxHash ? `<a target="_blank" rel="noreferrer" href="${txUrl(bounty.assignmentTxHash)}">Assignment tx</a>` : ''}
+            ${bounty.escrowFinishTxHash ? `<a target="_blank" rel="noreferrer" href="${txUrl(bounty.escrowFinishTxHash)}">EscrowFinish tx</a>` : ''}
           </div>
         </div>
-      `).join('') : '<p class="muted">No funded bounties yet.</p>'}
+      `).join('') : '<p class="muted">No locked bounties yet.</p>'}
     </div>
   `;
 }
@@ -1343,6 +1366,7 @@ function renderMerchant() {
   const analytics = merchantAnalytics(restaurant);
   const reviews = state.reviews.filter((r) => r.restaurantId === restaurant?.id && isChallengeWindowOpen(r));
   const minBounty = state.bountyRules?.minRewardPerExpertXrp || 2;
+  const bountyFormCurrency = state.bountyRules?.fundingCurrency || 'XRP';
   const totalBounty = Number(merchantBountyDraft.expertCount || 0) * Number(merchantBountyDraft.rewardPerExpertXrp || 0);
   view.innerHTML = `
     <section class="grid two">
@@ -1373,7 +1397,7 @@ function renderMerchant() {
         <div class="bounty-form">
           <label>Experts requested</label>
           <input id="bountyExpertCount" type="number" min="1" max="12" value="${escapeHtml(merchantBountyDraft.expertCount)}" />
-          <label>Reward per expert (XRP)</label>
+          <label>Reward per expert (${escapeHtml(bountyFormCurrency)})</label>
           <input id="bountyReward" type="number" min="${minBounty}" step="0.5" value="${escapeHtml(merchantBountyDraft.rewardPerExpertXrp)}" />
           <label>Focus area</label>
           <select id="bountyFocus">
@@ -1381,8 +1405,9 @@ function renderMerchant() {
           </select>
           <label>Instruction note</label>
           <textarea id="bountyNote" rows="3">${escapeHtml(merchantBountyDraft.note)}</textarea>
-          <div class="bounty-total"><span>Total funding</span><strong>${Number.isFinite(totalBounty) ? totalBounty.toFixed(2) : '0.00'} XRP</strong><small>minimum ${minBounty} XRP per expert</small></div>
-          <button id="publishBountyBtn" ${restaurant ? '' : 'disabled'}>Fund Bounty On XRPL</button>
+          <div class="bounty-total"><span>Total funding</span><strong>${bountyAssetLabel(totalBounty, bountyFormCurrency)}</strong><small>minimum ${minBounty} ${escapeHtml(bountyFormCurrency)} per expert</small></div>
+          <div class="escrow-hint">locked via TokenEscrow</div>
+          <button id="publishBountyBtn" ${restaurant ? '' : 'disabled'}>Lock Bounty On XRPL</button>
         </div>
         <h3>Bounty history</h3>
         ${renderBountyCards(restaurant)}
@@ -1427,12 +1452,12 @@ async function publishMerchantBounty() {
     const restaurant = restaurantById(restaurantId);
     if (!restaurant) throw new Error('Select a restaurant first.');
     const ok = await confirmAdminAction({
-      title: 'Fund review bounty?',
-      body: `This submits an XRPL payment from your merchant wallet to the TrustBite bounty pool for ${restaurant.name}.`,
-      confirmText: 'Yes, fund bounty'
+      title: 'Lock review bounty?',
+      body: `This creates an XRPL escrow from your merchant wallet for ${restaurant.name}.`,
+      confirmText: 'Yes, lock bounty'
     });
     if (!ok) return;
-    merchantActionNoticeHtml = '<strong>Submitting XRPL bounty payment...</strong>';
+    merchantActionNoticeHtml = '<strong>Creating XRPL bounty escrow...</strong><span>locked via TokenEscrow</span>';
     renderMerchant();
     const result = await api('/merchant/bounties', {
       method: 'POST',
@@ -1456,7 +1481,7 @@ async function publishMerchantBounty() {
 function buildMerchantResultHtml(result) {
   return [
     `<strong>${escapeHtml(result.message || 'Done.')}</strong>`,
-    result.fundingTxHash ? `<div class="message-links"><a target="_blank" rel="noreferrer" href="${txUrl(result.fundingTxHash)}">Bounty funding tx</a></div>` : ''
+    result.fundingTxHash ? `<div class="message-links"><a target="_blank" rel="noreferrer" href="${txUrl(result.fundingTxHash)}">EscrowCreate tx</a></div>` : ''
   ].filter(Boolean).join('');
 }
 
@@ -1547,7 +1572,7 @@ function renderAdmin() {
             <span>${escapeHtml(state.xrplServer)}</span>
           </div>
           <div class="wallet-grid">
-            ${state.wallets.map((w) => `<div class="wallet-card"><strong>${escapeHtml(w.label)}</strong><small>${escapeHtml(w.address || 'not created')}</small><span>${escapeHtml(w.balanceXrp || 'N/A')} XRP</span></div>`).join('')}
+            ${state.wallets.map((w) => `<div class="wallet-card"><strong>${escapeHtml(w.label)}</strong><small>${escapeHtml(w.address || 'not created')}</small><span>${escapeHtml(w.balanceXrp || 'N/A')} XRP${w.balanceTbt ? ` - ${escapeHtml(w.balanceTbt)} TBT` : ''}</span></div>`).join('')}
           </div>
         </details>
         <h3>Expert list</h3>
@@ -1602,12 +1627,14 @@ function renderAdmin() {
               const restaurant = restaurantById(bounty.restaurantId);
               return `
                 <div class="bounty-card">
-                  ${pill(bounty.status, bounty.status === 'assigned' ? 'good' : 'warn')}
+                  ${pill(bounty.status, bountyPillTone(bounty.status))}
                   <strong>${escapeHtml(restaurant?.name || 'Unknown restaurant')}</strong>
-                  <small>${bounty.totalXrp} XRP funded - ${bounty.expertCount} experts - ${escapeHtml(bounty.focusArea)}</small>
+                  <small>${bountyAssetLabel(bounty.totalXrp, bountyCurrency(bounty))} ${bountyMethodLabel(bounty)} - ${bounty.expertCount} experts - ${escapeHtml(bounty.focusArea)}</small>
+                  ${bounty.escrowSequence ? `<small>Escrow sequence ${escapeHtml(String(bounty.escrowSequence))}${bounty.escrowFinishAfter ? ` - release after ${escapeHtml(new Date(bounty.escrowFinishAfter).toLocaleString())}` : ''}</small>` : ''}
                   <div class="message-links">
-                    ${bounty.fundingTxHash ? `<a target="_blank" rel="noreferrer" href="${txUrl(bounty.fundingTxHash)}">Funding tx</a>` : ''}
+                    ${bounty.fundingTxHash ? `<a target="_blank" rel="noreferrer" href="${txUrl(bounty.fundingTxHash)}">EscrowCreate tx</a>` : ''}
                     ${bounty.assignmentTxHash ? `<a target="_blank" rel="noreferrer" href="${txUrl(bounty.assignmentTxHash)}">Assignment tx</a>` : ''}
+                    ${bounty.escrowFinishTxHash ? `<a target="_blank" rel="noreferrer" href="${txUrl(bounty.escrowFinishTxHash)}">EscrowFinish tx</a>` : ''}
                   </div>
                   <div class="assignment-picker">
                     ${activeExperts.map((expert) => `<label><input type="checkbox" data-bounty-expert="${bounty.id}" value="${expert.id}" ${bounty.assignedExpertIds?.includes(expert.id) ? 'checked' : ''} /> ${escapeHtml(anonymousExpertLabel(expert))} ${shortAddress(expert.xrplAddress)}</label>`).join('')}
@@ -1615,6 +1642,7 @@ function renderAdmin() {
                   <div class="actions">
                     <button data-bounty-random="${bounty.id}" class="secondary">Random Assign</button>
                     <button data-bounty-assign="${bounty.id}">Assign Selected</button>
+                    ${bounty.escrowSequence && !bounty.escrowFinishTxHash ? `<button data-bounty-release="${bounty.id}" class="secondary">Release Escrow</button>` : ''}
                   </div>
                 </div>
               `;
@@ -1697,6 +1725,15 @@ function renderAdmin() {
     if (!ok) return;
     return runAdmin(`/admin/bounties/${bountyId}/assign`, 'Submitting bounty assignment transaction...', { expertIds });
   }));
+  document.querySelectorAll('[data-bounty-release]').forEach((button) => button.addEventListener('click', async () => {
+    const ok = await confirmAdminAction({
+      title: 'Release bounty escrow?',
+      body: 'This submits XRPL EscrowFinish and releases the locked bounty to the bounty pool.',
+      confirmText: 'Yes, release'
+    });
+    if (!ok) return;
+    return runAdmin(`/admin/bounties/${button.dataset.bountyRelease}/release-escrow`, 'Submitting EscrowFinish transaction...');
+  }));
   document.querySelector('#adminReviewStatusFilter')?.addEventListener('change', (event) => {
     adminReviewStatusFilter = event.target.value;
     renderAdmin();
@@ -1741,8 +1778,9 @@ function buildAdminResultHtml(result) {
   if (result.acceptHash) links.push(`<a target="_blank" rel="noreferrer" href="${txUrl(result.acceptHash)}">CredentialAccept tx</a>`);
   if (result.deleteHash) links.push(`<a target="_blank" rel="noreferrer" href="${txUrl(result.deleteHash)}">CredentialDelete tx</a>`);
   if (result.governanceTxHash) links.push(`<a target="_blank" rel="noreferrer" href="${txUrl(result.governanceTxHash)}">Governance tx</a>`);
-  if (result.fundingTxHash) links.push(`<a target="_blank" rel="noreferrer" href="${txUrl(result.fundingTxHash)}">Funding tx</a>`);
+  if (result.fundingTxHash) links.push(`<a target="_blank" rel="noreferrer" href="${txUrl(result.fundingTxHash)}">EscrowCreate tx</a>`);
   if (result.assignmentTxHash) links.push(`<a target="_blank" rel="noreferrer" href="${txUrl(result.assignmentTxHash)}">Assignment tx</a>`);
+  if (result.escrowFinishTxHash) links.push(`<a target="_blank" rel="noreferrer" href="${txUrl(result.escrowFinishTxHash)}">EscrowFinish tx</a>`);
   if (result.rewardTxHash) links.push(`<a target="_blank" rel="noreferrer" href="${txUrl(result.rewardTxHash)}">Reward tx</a>`);
   return [
     `<strong>${escapeHtml(result.message || 'Done.')}</strong>`,
