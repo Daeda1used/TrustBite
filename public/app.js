@@ -69,6 +69,12 @@ const globalSession = document.querySelector('#globalSession');
 const refreshBtn = document.querySelector('#refreshBtn');
 
 refreshBtn.addEventListener('click', refresh);
+document.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-copy-address]');
+  if (!button) return;
+  event.preventDefault();
+  copyAddress(button.dataset.copyAddress);
+});
 
 function showMessage(text, isError = false, autoClearMs = 0) {
   if (messageClearTimer) {
@@ -436,22 +442,14 @@ async function copyAddress(address) {
   }
 }
 
-function bindCopyButtons(root = document) {
-  root.querySelectorAll('[data-copy-address]').forEach((button) => {
-    button.addEventListener('click', () => copyAddress(button.dataset.copyAddress));
-  });
-}
-
 function render() {
   if (!state) return;
   const page = currentPage();
   renderGlobalSession(page);
-  bindCopyButtons(globalSession);
   if (page === 'visitor') renderVisitor();
   if (page === 'expert') renderExpert();
   if (page === 'merchant') renderMerchant();
   if (page === 'admin') renderAdmin();
-  bindCopyButtons(view);
 }
 
 function renderGlobalSession(page) {
@@ -1271,9 +1269,28 @@ function renderDimensionBars(analytics) {
 
 function renderRatingTrend(analytics) {
   const rows = analytics.published.slice(-8);
+  if (!rows.length) return '<div class="trend-bars"><p class="muted">No trend data yet.</p></div>';
+  const dayCounts = {};
   return `
-    <div class="trend-bars">
-      ${rows.length ? rows.map((review) => `<span title="${escapeHtml(review.title)}"><i style="height:${Math.max(8, Number(review.rating || 0) * 20)}%"></i><small>${Number(review.rating || 0).toFixed(1)}</small></span>`).join('') : '<p class="muted">No trend data yet.</p>'}
+    <div class="trend-chart">
+      <div class="trend-axis-label">Published expert reviews over time</div>
+      <div class="trend-bars">
+        ${rows.map((review) => {
+          const date = new Date(review.publishedAt || review.submittedAt || Date.now());
+          const dayKey = date.toISOString().slice(0, 10);
+          dayCounts[dayKey] = (dayCounts[dayKey] || 0) + 1;
+          const baseDateLabel = date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+          const dateLabel = `${baseDateLabel}${dayCounts[dayKey] > 1 ? ` #${dayCounts[dayKey]}` : ''}`;
+          const rating = Number(review.rating || 0);
+          return `
+            <span title="${escapeHtml(review.title)}">
+              <b>${rating.toFixed(1)}</b>
+              <i style="height:${Math.max(8, rating * 20)}%"></i>
+              <small>${escapeHtml(dateLabel)}</small>
+            </span>
+          `;
+        }).join('')}
+      </div>
     </div>
   `;
 }
@@ -1578,30 +1595,32 @@ function renderAdmin() {
             </div>
           </article>
         `).join('') : `<p class="muted">${selectedExpert ? 'No reviews match this filter.' : 'Select an expert first.'}</p>`}</div>
-        <h2>Bounty Operations</h2>
-        <div class="bounty-admin-list">
-          ${bounties.length ? bounties.map((bounty) => {
-            const restaurant = restaurantById(bounty.restaurantId);
-            return `
-              <div class="bounty-card">
-                ${pill(bounty.status, bounty.status === 'assigned' ? 'good' : 'warn')}
-                <strong>${escapeHtml(restaurant?.name || 'Unknown restaurant')}</strong>
-                <small>${bounty.totalXrp} XRP funded - ${bounty.expertCount} experts - ${escapeHtml(bounty.focusArea)}</small>
-                <div class="message-links">
-                  ${bounty.fundingTxHash ? `<a target="_blank" rel="noreferrer" href="${txUrl(bounty.fundingTxHash)}">Funding tx</a>` : ''}
-                  ${bounty.assignmentTxHash ? `<a target="_blank" rel="noreferrer" href="${txUrl(bounty.assignmentTxHash)}">Assignment tx</a>` : ''}
+        <details class="admin-details bounty-operations-details">
+          <summary>Bounty Operations (${bounties.length})</summary>
+          <div class="bounty-admin-list">
+            ${bounties.length ? bounties.map((bounty) => {
+              const restaurant = restaurantById(bounty.restaurantId);
+              return `
+                <div class="bounty-card">
+                  ${pill(bounty.status, bounty.status === 'assigned' ? 'good' : 'warn')}
+                  <strong>${escapeHtml(restaurant?.name || 'Unknown restaurant')}</strong>
+                  <small>${bounty.totalXrp} XRP funded - ${bounty.expertCount} experts - ${escapeHtml(bounty.focusArea)}</small>
+                  <div class="message-links">
+                    ${bounty.fundingTxHash ? `<a target="_blank" rel="noreferrer" href="${txUrl(bounty.fundingTxHash)}">Funding tx</a>` : ''}
+                    ${bounty.assignmentTxHash ? `<a target="_blank" rel="noreferrer" href="${txUrl(bounty.assignmentTxHash)}">Assignment tx</a>` : ''}
+                  </div>
+                  <div class="assignment-picker">
+                    ${activeExperts.map((expert) => `<label><input type="checkbox" data-bounty-expert="${bounty.id}" value="${expert.id}" ${bounty.assignedExpertIds?.includes(expert.id) ? 'checked' : ''} /> ${escapeHtml(anonymousExpertLabel(expert))} ${shortAddress(expert.xrplAddress)}</label>`).join('')}
+                  </div>
+                  <div class="actions">
+                    <button data-bounty-random="${bounty.id}" class="secondary">Random Assign</button>
+                    <button data-bounty-assign="${bounty.id}">Assign Selected</button>
+                  </div>
                 </div>
-                <div class="assignment-picker">
-                  ${activeExperts.map((expert) => `<label><input type="checkbox" data-bounty-expert="${bounty.id}" value="${expert.id}" ${bounty.assignedExpertIds?.includes(expert.id) ? 'checked' : ''} /> ${escapeHtml(anonymousExpertLabel(expert))} ${shortAddress(expert.xrplAddress)}</label>`).join('')}
-                </div>
-                <div class="actions">
-                  <button data-bounty-random="${bounty.id}" class="secondary">Random Assign</button>
-                  <button data-bounty-assign="${bounty.id}">Assign Selected</button>
-                </div>
-              </div>
-            `;
-          }).join('') : '<p class="muted">No merchant bounties funded yet.</p>'}
-        </div>
+              `;
+            }).join('') : '<p class="muted">No merchant bounties funded yet.</p>'}
+          </div>
+        </details>
         <details class="admin-details audit-details">
           <summary>Audit Log</summary>
           <div class="audit-log">

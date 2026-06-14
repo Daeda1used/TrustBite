@@ -956,6 +956,12 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .audit-details {
   margin-top: 18px;
 }
+.bounty-operations-details {
+  margin-top: 18px;
+}
+.bounty-operations-details .bounty-admin-list {
+  padding: 12px;
+}
 .merchant-metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1015,6 +1021,15 @@ dd { margin: 0; overflow-wrap: anywhere; }
   border-radius: 8px;
   background: #fbfcfb;
 }
+.trend-chart {
+  display: grid;
+  gap: 8px;
+}
+.trend-axis-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 850;
+}
 .trend-bars span {
   flex: 1;
   min-width: 22px;
@@ -1023,15 +1038,23 @@ dd { margin: 0; overflow-wrap: anywhere; }
   gap: 5px;
   height: 120px;
 }
+.trend-bars b {
+  align-self: end;
+  justify-self: center;
+  color: var(--primary-dark);
+  font-size: 12px;
+}
 .trend-bars i {
   display: block;
   min-height: 8px;
+  width: 100%;
   border-radius: 6px 6px 2px 2px;
   background: linear-gradient(180deg, #b66f14, #006b6f);
 }
 .trend-bars small {
   text-align: center;
   font-size: 11px;
+  color: var(--muted);
 }
 .signal-list,
 .bounty-list,
