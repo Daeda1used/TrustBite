@@ -875,6 +875,7 @@ function walletList(wallets) {
     adminOperational: 'Admin / Credential Issuer',
     reviewRewardPool: 'Review Reward Pool',
     merchantBountyPool: 'Merchant Bounty Pool',
+    bountyTokenIssuer: 'Bounty Token Issuer',
     merchantPasta: 'Merchant Wallet 01',
     merchantVegan: 'Merchant Wallet 02',
     expertAnna: 'Expert Wallet 01',
@@ -888,7 +889,8 @@ function walletList(wallets) {
     key,
     label: labels[key],
     address: wallets[key]?.classicAddress || null,
-    balanceXrp: wallets[key]?.balanceXrp || null
+    balanceXrp: wallets[key]?.balanceXrp || null,
+    balanceTbt: wallets[key]?.balanceTbt || null
   }));
 }
 
@@ -937,7 +939,13 @@ function stateResponse() {
     wallets: walletList(wallets),
     candidateWallets: candidateWalletList(wallets),
     merchantWallets: merchantWalletList(wallets, db),
-    bountyRules: { minRewardPerExpertXrp: MIN_BOUNTY_REWARD_XRP }
+    bountyRules: {
+      minRewardPerExpertXrp: MIN_BOUNTY_REWARD_XRP,
+      fundingCurrency: BOUNTY_TOKEN_CURRENCY,
+      fundingMethod: 'token_escrow',
+      escrowHint: 'locked via TokenEscrow'
+    },
+    bountyTokenSetup: wallets.bountyTokenSetup || null
   };
 }
 
@@ -1053,6 +1061,7 @@ async function apiBootstrap() {
     ['adminOperational', 'Admin / Credential Issuer'],
     ['reviewRewardPool', 'Review Reward Pool'],
     ['merchantBountyPool', 'Merchant Bounty Pool'],
+    ['bountyTokenIssuer', 'Bounty Token Issuer'],
     ['merchantPasta', 'Merchant Wallet 01'],
     ['merchantVegan', 'Merchant Wallet 02'],
     ['expertAnna', 'Expert Wallet 01'],
@@ -1074,6 +1083,7 @@ async function apiBootstrap() {
       }
       wallets[key].balanceXrp = await getBalance(client, wallets[key].classicAddress);
     }
+    await setupBountyTokenInfrastructure(client, wallets);
   });
   for (const expert of db.experts) {
     const wallet = wallets[expert.walletKey];
@@ -1091,11 +1101,11 @@ async function apiBootstrap() {
     entityId: 'bootstrap',
     action: 'xrpl_wallets_bootstrapped',
     actorType: 'admin',
-    reason: `Funded: ${funded.join(', ') || 'none'}; reused: ${reused.join(', ') || 'none'}.`
+    reason: `Funded: ${funded.join(', ') || 'none'}; reused: ${reused.join(', ') || 'none'}. Bounty token escrow infrastructure ready.`
   });
   saveWallets(wallets);
   saveDb(db);
-  return { message: `Wallet bootstrap complete. Funded: ${funded.join(', ') || 'none'}. Reused: ${reused.join(', ') || 'none'}.`, state: stateResponse() };
+  return { message: `Wallet bootstrap complete. Bounty token escrow infrastructure ready. Funded: ${funded.join(', ') || 'none'}. Reused: ${reused.join(', ') || 'none'}.`, state: stateResponse() };
 }
 
 async function apiRefreshBalances() {
@@ -1104,6 +1114,7 @@ async function apiRefreshBalances() {
     for (const wallet of Object.values(wallets)) {
       if (wallet.classicAddress) wallet.balanceXrp = await getBalance(client, wallet.classicAddress);
     }
+    await refreshBountyTokenBalances(client, wallets);
   });
   saveWallets(wallets);
   return { message: 'Balances refreshed.', state: stateResponse() };
