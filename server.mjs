@@ -1039,6 +1039,12 @@ async function handleApi(req, res, pathname) {
     return json(res, 200, await apiAssignBounty(match[1], { mode: 'manual', expertIds: body.expertIds }));
   }
 
+  match = pathname.match(/^\/api\/admin\/bounties\/([^/]+)\/release-escrow$/);
+  if (req.method === 'POST' && match) {
+    requireAdminLoginSession(body.adminSessionToken);
+    return json(res, 200, await apiReleaseBountyEscrow(match[1]));
+  }
+
   match = pathname.match(/^\/api\/admin\/reviews\/([^/]+)\/publish$/);
   if (req.method === 'POST' && match) {
     requireAdminLoginSession(body.adminSessionToken);
@@ -1980,6 +1986,8 @@ async function apiCreateMerchantBounty(body) {
   const merchantWallet = walletFromStored(wallets[session.walletKey]);
   const bountyPoolAddress = wallets.merchantBountyPool?.classicAddress;
   if (!merchantWallet || !bountyPoolAddress) throw new Error('Merchant wallet or bounty pool wallet is missing. Run bootstrap first.');
+  const tokenSetup = ensureBountyTokenSetup(wallets);
+  const tokenIssuerAddress = wallets.bountyTokenIssuer?.classicAddress;
 
   const expertCount = Number(body.expertCount);
   const rewardPerExpertXrp = Number(body.rewardPerExpertXrp);
@@ -2004,14 +2012,31 @@ async function apiCreateMerchantBounty(body) {
     noteHash: sha256(note || 'no_note'),
     createdAt
   };
-  const fundingTxHash = await submitMemoPayment({
-    fromWallet: merchantWallet,
-    toAddress: bountyPoolAddress,
-    drops: xrpl.xrpToDrops(String(totalXrp)),
-    memo: {
-      type: 'trustbite_review_bounty_funding',
-      ...bountyPayload
+  let funding;
+  let fundingWarning = null;
+  try {
+    if (!tokenSetup.ready || !tokenIssuerAddress) {
+      throw new Error('Bounty token escrow infrastructure is not ready. Run Admin bootstrap first.');
     }
+    funding = await createTokenBountyEscrow({
+      merchantWallet,
+      bountyPoolAddress,
+      tokenIssuerAddress,
+      totalXrp,
+      bountyPayload
+    });
+  } catch (err) {
+    fundingWarning = `TokenEscrow fallback: ${err.message}`;
+    funding = await createXrpBountyEscrow({
+      merchantWallet,
+      bountyPoolAddress,
+      totalXrp,
+      bountyPayload
+    });
+  }
+  await withClient(async (client) => {
+    wallets[session.walletKey].balanceXrp = await getBalance(client, merchantWallet.classicAddress);
+    await refreshBountyTokenBalances(client, wallets);
   });
   const bounty = {
     id: bountyId,
@@ -2022,13 +2047,21 @@ async function apiCreateMerchantBounty(body) {
     expertCount,
     rewardPerExpertXrp,
     totalXrp,
+    fundingCurrency: funding.fundingCurrency,
+    fundingMethod: funding.fundingMethod,
     focusArea,
     note,
     payloadHash: sha256(bountyPayload),
-    fundingTxHash,
+    fundingTxHash: funding.fundingTxHash,
+    escrowCreateTxHash: funding.fundingTxHash,
+    escrowSequence: funding.escrowSequence,
+    escrowFinishAfter: funding.escrowFinishAfter,
+    escrowCancelAfter: funding.escrowCancelAfter,
+    escrowFinishTxHash: null,
+    fundingWarning,
     assignmentTxHash: null,
     assignedExpertIds: [],
-    status: 'funded',
+    status: 'locked',
     createdAt,
     assignedAt: null
   };
@@ -2038,11 +2071,19 @@ async function apiCreateMerchantBounty(body) {
     entityId: bounty.id,
     action: 'merchant_bounty_funded',
     actorType: 'merchant',
-    reason: `${totalXrp} XRP funded for ${expertCount} expert visits.`,
-    xrplTxHash: fundingTxHash
+    reason: `${totalXrp} ${funding.fundingCurrency} locked via ${funding.fundingMethod} for ${expertCount} expert visits.`,
+    xrplTxHash: funding.fundingTxHash
   });
+  saveWallets(wallets);
   saveDb(db);
-  return { message: `Bounty funded with ${totalXrp} XRP.`, bounty, fundingTxHash };
+  return {
+    message: fundingWarning
+      ? `Bounty locked with ${totalXrp} ${funding.fundingCurrency}. ${fundingWarning}`
+      : `Bounty locked with ${totalXrp} ${funding.fundingCurrency} via TokenEscrow.`,
+    bounty,
+    fundingTxHash: funding.fundingTxHash,
+    warning: fundingWarning
+  };
 }
 
 async function apiAssignBounty(bountyId, { mode, expertIds = [] }) {
@@ -2050,7 +2091,7 @@ async function apiAssignBounty(bountyId, { mode, expertIds = [] }) {
   const wallets = loadWallets();
   const bounty = db.bounties.find((item) => item.id === bountyId);
   if (!bounty) throw new Error('Bounty not found.');
-  if (!['funded', 'assigned'].includes(bounty.status)) throw new Error('This bounty is not assignable.');
+  if (!['funded', 'locked', 'assigned'].includes(bounty.status)) throw new Error('This bounty is not assignable.');
   const issuerWallet = walletFromStored(wallets.adminOperational);
   if (!issuerWallet) throw new Error('Admin issuer wallet is missing. Run bootstrap first.');
   const assignmentDestination = bounty.bountyPoolAddress || wallets.merchantBountyPool?.classicAddress;
@@ -2084,6 +2125,7 @@ async function apiAssignBounty(bountyId, { mode, expertIds = [] }) {
       assignedAt
     }
   });
+  const oldStatus = bounty.status;
   bounty.status = 'assigned';
   bounty.assignedExpertIds = selectedExperts.map((expert) => expert.id);
   bounty.assignmentTxHash = assignmentTxHash;
@@ -2092,7 +2134,7 @@ async function apiAssignBounty(bountyId, { mode, expertIds = [] }) {
     entityType: 'bounty',
     entityId: bounty.id,
     action: 'bounty_assigned',
-    fromStatus: 'funded',
+    fromStatus: oldStatus,
     toStatus: 'assigned',
     actorType: 'admin',
     reason: `${selectedExperts.length} experts assigned through ${mode} selection.`,
@@ -2100,6 +2142,33 @@ async function apiAssignBounty(bountyId, { mode, expertIds = [] }) {
   });
   saveDb(db);
   return { message: `Bounty assigned to ${selectedExperts.length} experts.`, bounty, assignmentTxHash };
+}
+
+async function apiReleaseBountyEscrow(bountyId) {
+  const db = loadDb();
+  const wallets = loadWallets();
+  const bounty = db.bounties.find((item) => item.id === bountyId);
+  if (!bounty) throw new Error('Bounty not found.');
+  if (!bounty.escrowSequence || !bounty.escrowCreateTxHash) throw new Error('This bounty was not funded through an escrow.');
+  if (bounty.escrowFinishTxHash) return { message: 'Escrow already released.', bounty, escrowFinishTxHash: bounty.escrowFinishTxHash };
+  const oldStatus = bounty.status;
+  const txHash = await finishBountyEscrowOnLedger(wallets, bounty);
+  bounty.status = 'released';
+  bounty.escrowFinishTxHash = txHash;
+  bounty.releasedAt = now();
+  addAudit(db, {
+    entityType: 'bounty',
+    entityId: bounty.id,
+    action: 'bounty_escrow_released',
+    fromStatus: oldStatus,
+    toStatus: 'released',
+    actorType: 'admin',
+    reason: `${bounty.totalXrp} ${bounty.fundingCurrency || 'XRP'} released from escrow to the bounty pool.`,
+    xrplTxHash: txHash
+  });
+  saveWallets(wallets);
+  saveDb(db);
+  return { message: 'Bounty escrow released to the bounty pool.', bounty, escrowFinishTxHash: txHash };
 }
 
 function apiChallengeReview(reviewId, body) {
