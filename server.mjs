@@ -40,6 +40,11 @@ const MERCHANT_WALLETS = [
   { key: 'merchantVegan', label: 'Merchant Wallet 02', restaurantId: 'rest-queens-vegan' }
 ];
 const MIN_BOUNTY_REWARD_XRP = 2;
+const BOUNTY_TOKEN_CURRENCY = 'TBT';
+const BOUNTY_TOKEN_LIMIT = '1000000';
+const BOUNTY_TOKEN_MERCHANT_FLOAT = '5000';
+const BOUNTY_ESCROW_FINISH_DELAY_SECONDS = 10;
+const BOUNTY_ESCROW_CANCEL_AFTER_DAYS = 30;
 
 function now() {
   return new Date().toISOString();
@@ -514,13 +519,18 @@ function memoFor(data) {
   }];
 }
 
-async function submitAndWait(client, wallet, tx) {
+async function submitAndWaitResult(client, wallet, tx) {
   const prepared = await client.autofill(tx);
   const signed = wallet.sign(prepared);
   const result = await client.submitAndWait(signed.tx_blob);
   const code = result.result.meta?.TransactionResult;
   if (code !== 'tesSUCCESS') throw new Error(`XRPL transaction failed: ${code}`);
-  return result.result.hash;
+  return result.result;
+}
+
+async function submitAndWait(client, wallet, tx) {
+  const result = await submitAndWaitResult(client, wallet, tx);
+  return result.hash;
 }
 
 async function submitMemoPayment({ fromWallet, toAddress, memo, drops = '1' }) {
@@ -551,6 +561,209 @@ async function fundWallet(client, label) {
     balanceXrp: funded.balance,
     createdAt: now()
   };
+}
+
+function tokenValue(value) {
+  const normalized = Number(value);
+  if (!Number.isFinite(normalized)) return '0';
+  return normalized.toFixed(6).replace(/\.?0+$/, '');
+}
+
+function rippleTimeAfterSeconds(seconds) {
+  return xrpl.isoTimeToRippleTime(new Date(Date.now() + seconds * 1000).toISOString());
+}
+
+function rippleTimeAfterDays(days) {
+  return rippleTimeAfterSeconds(days * 24 * 60 * 60);
+}
+
+function ensureBountyTokenSetup(wallets) {
+  if (!wallets.bountyTokenSetup) {
+    wallets.bountyTokenSetup = {
+      currency: BOUNTY_TOKEN_CURRENCY,
+      issuerAddress: null,
+      allowTrustLineLockingTxHash: null,
+      trustlineTxHashes: {},
+      distributionTxHashes: {},
+      ready: false,
+      updatedAt: null
+    };
+  }
+  if (!wallets.bountyTokenSetup.trustlineTxHashes) wallets.bountyTokenSetup.trustlineTxHashes = {};
+  if (!wallets.bountyTokenSetup.distributionTxHashes) wallets.bountyTokenSetup.distributionTxHashes = {};
+  return wallets.bountyTokenSetup;
+}
+
+async function getTrustLineBalance(client, address, issuer, currency) {
+  try {
+    const response = await client.request({
+      command: 'account_lines',
+      account: address,
+      ledger_index: 'validated',
+      peer: issuer
+    });
+    const line = response.result.lines.find((item) => item.account === issuer && item.currency === currency);
+    return line ? Number(line.balance).toFixed(2) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function refreshBountyTokenBalances(client, wallets) {
+  const issuer = wallets.bountyTokenIssuer?.classicAddress;
+  if (!issuer) return;
+  for (const key of ['merchantPasta', 'merchantVegan', 'merchantBountyPool']) {
+    if (wallets[key]?.classicAddress) {
+      wallets[key].balanceTbt = await getTrustLineBalance(client, wallets[key].classicAddress, issuer, BOUNTY_TOKEN_CURRENCY);
+    }
+  }
+}
+
+async function setupBountyTokenInfrastructure(client, wallets) {
+  const setup = ensureBountyTokenSetup(wallets);
+  const issuerWallet = walletFromStored(wallets.bountyTokenIssuer);
+  if (!issuerWallet) throw new Error('Bounty token issuer wallet is missing. Run bootstrap first.');
+  setup.issuerAddress = issuerWallet.classicAddress;
+
+  if (!setup.allowTrustLineLockingTxHash) {
+    try {
+      const result = await submitAndWaitResult(client, issuerWallet, {
+        TransactionType: 'AccountSet',
+        Account: issuerWallet.classicAddress,
+        SetFlag: xrpl.AccountSetAsfFlags.asfAllowTrustLineLocking
+      });
+      setup.allowTrustLineLockingTxHash = result.hash;
+    } catch (err) {
+      if (String(err.message || err).includes('tecNO_ALTER')) {
+        setup.allowTrustLineLockingTxHash = 'already_enabled';
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  const trustlineWalletKeys = ['merchantPasta', 'merchantVegan', 'merchantBountyPool'];
+  for (const key of trustlineWalletKeys) {
+    const holderWallet = walletFromStored(wallets[key]);
+    if (!holderWallet || setup.trustlineTxHashes[key]) continue;
+    const result = await submitAndWaitResult(client, holderWallet, {
+      TransactionType: 'TrustSet',
+      Account: holderWallet.classicAddress,
+      LimitAmount: {
+        currency: BOUNTY_TOKEN_CURRENCY,
+        issuer: issuerWallet.classicAddress,
+        value: BOUNTY_TOKEN_LIMIT
+      }
+    });
+    setup.trustlineTxHashes[key] = result.hash;
+  }
+
+  for (const key of ['merchantPasta', 'merchantVegan']) {
+    const merchantWallet = walletFromStored(wallets[key]);
+    if (!merchantWallet || setup.distributionTxHashes[key]) continue;
+    const result = await submitAndWaitResult(client, issuerWallet, {
+      TransactionType: 'Payment',
+      Account: issuerWallet.classicAddress,
+      Destination: merchantWallet.classicAddress,
+      Amount: {
+        currency: BOUNTY_TOKEN_CURRENCY,
+        issuer: issuerWallet.classicAddress,
+        value: BOUNTY_TOKEN_MERCHANT_FLOAT
+      },
+      Memos: memoFor({
+        type: 'trustbite_bounty_token_distribution',
+        currency: BOUNTY_TOKEN_CURRENCY,
+        recipientAddressHash: sha256(merchantWallet.classicAddress),
+        value: BOUNTY_TOKEN_MERCHANT_FLOAT
+      })
+    });
+    setup.distributionTxHashes[key] = result.hash;
+  }
+
+  await refreshBountyTokenBalances(client, wallets);
+  setup.ready = true;
+  setup.updatedAt = now();
+  return setup;
+}
+
+async function createTokenBountyEscrow({ merchantWallet, bountyPoolAddress, tokenIssuerAddress, totalXrp, bountyPayload }) {
+  const finishAfter = rippleTimeAfterSeconds(BOUNTY_ESCROW_FINISH_DELAY_SECONDS);
+  const cancelAfter = rippleTimeAfterDays(BOUNTY_ESCROW_CANCEL_AFTER_DAYS);
+  return withClient(async (client) => {
+    const result = await submitAndWaitResult(client, merchantWallet, {
+      TransactionType: 'EscrowCreate',
+      Account: merchantWallet.classicAddress,
+      Destination: bountyPoolAddress,
+      Amount: {
+        currency: BOUNTY_TOKEN_CURRENCY,
+        issuer: tokenIssuerAddress,
+        value: tokenValue(totalXrp)
+      },
+      FinishAfter: finishAfter,
+      CancelAfter: cancelAfter,
+      Memos: memoFor({
+        type: 'trustbite_review_bounty_token_escrow',
+        tokenEscrow: true,
+        fundingCurrency: BOUNTY_TOKEN_CURRENCY,
+        ...bountyPayload
+      })
+    });
+    const txJson = result.tx_json || result.tx || {};
+    return {
+      fundingMethod: 'token_escrow',
+      fundingCurrency: BOUNTY_TOKEN_CURRENCY,
+      fundingTxHash: result.hash,
+      escrowSequence: txJson.Sequence,
+      escrowFinishAfter: xrpl.rippleTimeToISOTime(finishAfter),
+      escrowCancelAfter: xrpl.rippleTimeToISOTime(cancelAfter)
+    };
+  });
+}
+
+async function createXrpBountyEscrow({ merchantWallet, bountyPoolAddress, totalXrp, bountyPayload }) {
+  const finishAfter = rippleTimeAfterSeconds(BOUNTY_ESCROW_FINISH_DELAY_SECONDS);
+  const cancelAfter = rippleTimeAfterDays(BOUNTY_ESCROW_CANCEL_AFTER_DAYS);
+  return withClient(async (client) => {
+    const result = await submitAndWaitResult(client, merchantWallet, {
+      TransactionType: 'EscrowCreate',
+      Account: merchantWallet.classicAddress,
+      Destination: bountyPoolAddress,
+      Amount: xrpl.xrpToDrops(String(totalXrp)),
+      FinishAfter: finishAfter,
+      CancelAfter: cancelAfter,
+      Memos: memoFor({
+        type: 'trustbite_review_bounty_xrp_escrow_fallback',
+        tokenEscrow: false,
+        fundingCurrency: 'XRP',
+        ...bountyPayload
+      })
+    });
+    const txJson = result.tx_json || result.tx || {};
+    return {
+      fundingMethod: 'xrp_escrow_fallback',
+      fundingCurrency: 'XRP',
+      fundingTxHash: result.hash,
+      escrowSequence: txJson.Sequence,
+      escrowFinishAfter: xrpl.rippleTimeToISOTime(finishAfter),
+      escrowCancelAfter: xrpl.rippleTimeToISOTime(cancelAfter)
+    };
+  });
+}
+
+async function finishBountyEscrowOnLedger(wallets, bounty) {
+  const adminWallet = walletFromStored(wallets.adminOperational);
+  if (!adminWallet) throw new Error('Admin issuer wallet is missing. Run bootstrap first.');
+  if (!bounty.escrowSequence) throw new Error('This bounty does not have an escrow sequence.');
+  return withClient(async (client) => {
+    const result = await submitAndWaitResult(client, adminWallet, {
+      TransactionType: 'EscrowFinish',
+      Account: adminWallet.classicAddress,
+      Owner: bounty.merchantAddress,
+      OfferSequence: bounty.escrowSequence
+    });
+    await refreshBountyTokenBalances(client, wallets);
+    return result.hash;
+  });
 }
 
 function credentialHex() {
